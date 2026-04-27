@@ -13,7 +13,7 @@ A scalable, VLM-first pipeline for 1.5M+ PDFs refreshed bi-weekly, extendable fr
 
 - **Parse once, extract many.** The expensive VLM parse runs exactly once per content hash. Re-extracting a new attribute across all 1.5M PDFs costs ~$30 against cached Markdown — not $3,000 for a full re-parse.
 
-- **VLM as the default extractor.** Gemini 2.5 Flash-Lite ($0.10/$0.40 per MTok input/output at standard rate; 50% off on Flex/Batch) replaces the PaddleOCR + LayoutParser + LayoutReader + table-transformer stack. One model handles scanned pages, multi-column layouts, tables, and images.
+- **VLM as the default extractor.** Gemini 2.5 Flash-Lite ($0.10/$0.40 per MTok input/output at standard rate; 50% off on Flex/Batch) replaces the PyMuPDF4LLM + LayoutParser + LayoutReader + PaddleOCR + Agentic stack. One model handles scanned pages, multi-column layouts, tables, and images.
 
 - **Two processing buckets.** Source bucket alone determines processing tier — no classification logic, no urgency tagger. PDFs in `fast/` use real-time Gemini on Lambda; PDFs in `slow/` use Fargate with 50%-discounted Gemini Flex/Batch.
 
@@ -280,6 +280,51 @@ Query → Query Rewriter (small LLM) decomposes into structured filters → ES s
 | Self-improving | No | Requires retraining | No | Yes |
 
 **Gemini Document Processor** is the primary parser — the only option that handles every page type in one call, produces LLM-native output, carries minimal operational overhead, and improves for free with each Google release. Parse cost is amortized over the lifetime of the cached artifact.
+
+#### VLM Approach — Current Validity & Migration Trigger
+
+The VLM-first approach is viable today under two conditions that currently hold:
+
+1. **Low page counts per PDF.** Lighting datasheets are typically 1–8 pages. Gemini 2.5 Flash-Lite token costs remain bounded and predictable at this scale.
+2. **Stable, cheap model availability.** Gemini 2.5 Flash-Lite at $0.10/$0.40 per MTok (50% off on Flex/Batch) keeps the blended per-PDF cost well under the $0.002 target.
+
+**If either condition breaks — pages grow significantly (e.g., 50+ page catalogs enter the corpus) or Gemini 2.5 Flash-Lite is deprecated/repriced — the pipeline must migrate to a hybrid deterministic + agent stack.**
+
+#### Hybrid Architecture
+
+The hybrid pipeline replaces the single VLM call with a three-stage deterministic pre-processing layer that feeds a targeted LangChain agent. The agent calls VLM tools only on layout-detected regions of interest (charts, tables) rather than full pages — decoupling token cost from page count.
+
+![Hybrid Pipeline Architecture](hybrid-architecture.png)
+
+**Stage breakdown:**
+
+| **Stage** | **Component** | **Output** |
+|---|---|---|
+| Text extraction | PaddleOCR | Text strings, bounding boxes, confidence scores |
+| Region detection | PaddleOCR LayoutDetect | Tables, charts, text block boundaries |
+| Reading order | LayoutReader | Correct traversal order across multi-column and table regions |
+| Attribute extraction | LangChain Agent + VLM tools | Structured Markdown — same format as VLM path |
+
+**LangChain Agent system prompt receives:**
+- All OCR text in LayoutReader-determined reading order
+- Layout region IDs and types (table, chart, text block)
+- Tool descriptions for `AnalyzeChart` and `AnalyzeTable`
+
+**Agent tools:**
+
+| **Tool** | **Input** | **Returns** |
+|---|---|---|
+| `AnalyzeChart` | Cropped chart image → VLM | Chart type, axes, data points, trends |
+| `AnalyzeTable` | Cropped table image → VLM | Headers, rows, values, notes |
+
+The agent invokes these tools only on regions flagged by LayoutDetect — a 50-page catalog may contain 3 charts and 5 tables, incurring VLM cost on 8 crops rather than 50 full pages.
+
+The canonical Markdown artifact format is preserved — downstream extractor, diff, and serving stages require no changes. The tradeoff is operational complexity: a GPU Fargate fleet for PaddleOCR, three additional model dependencies, and assembly logic to stitch ordered OCR text with agent tool outputs.
+
+**Migration signals to watch:**
+- Average pages-per-PDF exceeds 5
+- Gemini 2.5 Flash-Lite deprecation notice issued by Google
+- Blended parse cost per PDF exceeds $0.002
 
 ### 3.4.2 Two Processing Buckets
 
