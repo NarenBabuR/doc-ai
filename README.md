@@ -294,7 +294,7 @@ The VLM-first approach is viable today under two conditions that currently hold:
 
 The hybrid pipeline replaces the single VLM call with a three-stage deterministic pre-processing layer that feeds a targeted LangChain agent. The agent calls VLM tools only on layout-detected regions of interest (charts, tables) rather than full pages — decoupling token cost from page count.
 
-![Hybrid Pipeline Architecture](hybrid-architecture.png)
+![Hybrid Pipeline Architecture](hybrid_architecture.png)
 
 **Stage breakdown:**
 
