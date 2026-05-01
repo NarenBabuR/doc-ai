@@ -21,7 +21,7 @@ A scalable, VLM-first pipeline for 1.5M+ PDFs refreshed bi-weekly, extendable fr
 
 - **Diff-based incremental extraction.** For the ~20% of PDFs that change each cycle, a section-level diff is computed and only changed sections are sent to the LLM. Unchanged sections retain previously extracted values — cutting token cost ~70–85% on typical churn PDFs.
 
-- **Bigger LLM for Inferred and Empty fields.** Fields tagged Inferred or Empty are re-run through Gemini 2.5 Flash ($0.15/$1.25 per MTok input/output) with a targeted prompt to resolve uncertain inferences and recover genuinely absent fields.
+- **Bigger LLM for Inferred and Empty fields.** Fields tagged Inferred or Empty are re-run through Gemini 2.5 Flash ($0.15/$1.25 per MTok input/output — Flex/Batch price; standard $0.30/$2.50) with a targeted prompt to resolve uncertain inferences and recover genuinely absent fields.
 
 - **One PDF ≠ one product.** The pipeline emits 1..N product SKU records per PDF (ordering matrices expand into many orderable SKUs).
 
@@ -151,7 +151,7 @@ A scalable, VLM-first pipeline for 1.5M+ PDFs refreshed bi-weekly, extendable fr
  │          ┌───────────────────────────┐                 │                         │
  │          │  BIGGER LLM FALLBACK      │                 │                         │
  │          │  Gemini 2.5 Flash         │                 │                         │
- │          │  $0.15 / $1.25 per MTok   │                 │                         │
+ │          │  $0.15/$1.25 (Flex/Batch)  │                 │                         │
  │          │                           │                 │                         │
  │          │  Triggered for Inferred + │                 │                         │
  │          │  Empty fields (~10% PDFs) │                 │                         │
@@ -254,7 +254,7 @@ Diff-based extraction applies to both Fast and Slow paths. Any changed PDF — r
 
 - Canonical Markdown + page images written permanently to `s3://parspec-canonical/<hash>/`.
 - Extractor (Pydantic-validated SKU JSON, temperature=0; product image classified within the same call) runs first. From there, two steps proceed in parallel: (1) Postprocess (unit normalization, range validation, Present/Inferred/Empty tagging) → Bigger LLM for Inferred and Empty derived values; (2) Image Embeddings (Gemini Embedding 2 — $0.00012/image). Both branches converge before indexing into Elasticsearch.
-- Fast path: Lambda calls Gemini Standard/Priority (~3–5 sec). Slow path: Fargate calls Gemini Flex/Batch (50% off, 1 min–24 h). Both converge at the same canonical artifact and extraction stages.
+- Fast path: Lambda calls Gemini Standard/Priority (~3–5 sec). Slow path: Fargate calls Gemini Flex/Batch (50% off, 1 mins–24 h). Both converge at the same canonical artifact and extraction stages.
 
 **Query time**
 
@@ -342,7 +342,7 @@ Routing is determined entirely by source bucket path — no document classificat
 
 ### 3.4.3 Bigger LLM Fallback — Inferred and Empty Fields Only
 
-The bigger LLM (Gemini 2.5 Flash at $0.15/$1.25 per MTok input/output) is invoked specifically for fields tagged **Inferred** or **Empty** — not as a blanket confidence-threshold fallback. No human review queue sits in the hot path.
+The bigger LLM (Gemini 2.5 Flash at $0.15/$1.25 per MTok input/output on Flex/Batch; standard $0.30/$2.50) is invoked specifically for fields tagged **Inferred** or **Empty** — not as a blanket confidence-threshold fallback. No human review queue sits in the hot path.
 
 Every extracted field carries a provenance label:
 
@@ -475,29 +475,13 @@ Every extracted field is tagged:
 
 ## 4.7 Bigger LLM Fallback
 
-Fields tagged Inferred or Empty are re-run through Gemini 2.5 Flash ($0.15/$1.25 per MTok input/output) with a targeted prompt scoped to those specific fields. After this pass, every field resolves to Present / Inferred / Empty. Fields that remain genuinely unresolvable are stored as `Empty`.
+Fields tagged Inferred or Empty are re-run through Gemini 2.5 Flash ($0.15/$1.25 per MTok input/output on Flex/Batch; standard $0.30/$2.50) with a targeted prompt scoped to those specific fields. After this pass, every field resolves to Present / Inferred / Empty. Fields that remain genuinely unresolvable are stored as `Empty`.
 
 ---
 
-# 5. Search & Serving
+# 5. Search
 
-## 5.1 Index Design
-
-A single Elasticsearch index `products_v<schema_version>` — one document per SKU. A new schema version creates a new index; aliases flip atomically (zero-downtime migrations).
-
-| **Field** | **Type** | **Role** |
-|---|---|---|
-| `model_number` | keyword + ngram | Exact + fuzzy match |
-| `category`, `mounting_type` | keyword | Structured filter |
-| `wattage_w`, `cct_k`, `lumens`, `cri` | float/integer | Range filters |
-| `voltage_min`, `voltage_max` | integer | Range filter |
-| `description_card` | text (BM25) | Free-text match component |
-| `image_embedding` | dense_vector (Gemini Embedding 2) | Reverse image search |
-| `provenance.<field>` | keyword | Per-field Present/Inferred/Empty tag |
-| `source_pdf_hash`, `source_pages` | keyword, integer[] | Provenance/explainability |
-| `extractor_version` | keyword | Re-extraction audit trail |
-
-## 5.2 Query Flow
+## 5.1 Query Flow
 
 Query → Query Rewriter (small LLM, Redis-cached): NL → structured filters → Elasticsearch search (top-20) → clicks captured in DynamoDB per-tenant preference memory.
 
@@ -505,7 +489,7 @@ Because the query rewriter converts natural language into fully structured filte
 
 Example: "2-inch aperture downlights with DALI dimming, 3000K, 120V" → structured filters (aperture=2", category=downlight, dimming=DALI, CCT=3000K, voltage=120V).
 
-## 5.3 Image Search
+## 5.2 Image Search
 
 Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `image_embedding` dense_vector. This step runs in parallel with post-processing and the bigger LLM fallback — not sequentially after them — reducing overall latency. Supports reverse image search (upload product photo → find matching SKUs). No GPU infrastructure required.
 
@@ -519,6 +503,8 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 |---|---|
 | Total PDF corpus | 1,500,000 |
 | New/changed PDFs per cycle (bi-weekly) | 300,000 (20%) |
+| Fast-path PDFs (real-time, Lambda + Gemini Standard) | ~3% of total |
+| Slow-path PDFs (batch, Fargate + Gemini Flex/Batch) | ~97% of total |
 | Changed PDFs: minor change (<30% of doc) | ~70% |
 | Changed PDFs: major revision (≥30%) | ~30% |
 | Avg diff payload (minor changes) | ~1,200 tokens input + 500 tokens output |
@@ -530,7 +516,7 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 ## 6.2 Per-PDF Cost Breakdown
 
 **Gemini 2.5 Flash-Lite pricing:** $0.10/$0.40 per MTok input/output (standard); 50% off on Flex/Batch.
-**Gemini 2.5 Flash (bigger LLM) pricing:** $0.15/$1.25 per MTok input/output.
+**Gemini 2.5 Flash (bigger LLM) pricing:** $0.30/$2.50 per MTok input/output (standard); 50% off on Flex/Batch.
 
 | **Cost Line** | **Unit Price** | **Fast Path** | **Slow Path (50% off)** | **Blended** |
 |---|---|---|---|---|
@@ -540,7 +526,7 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 | Extract (full): Gemini 2.5 Flash-Lite output | $0.40 / MTok | $0.000300 | $0.000150 | $0.000155 |
 | Diff-extract (minor changes, 70% of churn) | 15% of full extract | — | $0.000045 | $0.000044 |
 | Image embedding (Gemini Embedding 2) | $0.00012/image | $0.000120 | $0.000120 | $0.000120 |
-| Bigger LLM fallback — Inferred/Empty fields (10% of PDFs) | ~$0.008/call | $0.000800 | $0.000800 | $0.000800 |
+| Bigger LLM fallback — Inferred/Empty fields (10% of PDFs) | ~$0.008/call (std) / ~$0.004/call (Flex/Batch) | $0.000800 | $0.000400 | $0.000412 |
 | AWS: Lambda + SQS + EventBridge | amortized | $0.000080 | $0.000080 | $0.000080 |
 | AWS: S3 storage + PUT/GET | amortized | $0.000040 | $0.000040 | $0.000040 |
 | AWS: Elasticsearch indexing + storage | amortized | $0.000200 | $0.000200 | $0.000200 |
@@ -560,23 +546,19 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 
 | **Layer** | **Technology** | **Why** |
 |---|---|---|
-| Compute — short handlers | AWS Lambda | Sub-second event handlers; scales 0 → thousands instantly |
-| Compute — Slow-path extraction | AWS Fargate tasks (ephemeral ECS) | No 15-min timeout; serverless, no idle cost |
-| Orchestration | EventBridge (routing), SQS FIFO (queue + dedup + retry) | Simple linear DAG; sufficient for this topology |
-| Storage | S3 (raw/canonical/derived), DynamoDB (registry, preferences), Redis Elasticache (query cache) | S3 tiered lifecycle; DynamoDB for low-latency KV; Redis for sub-ms cache hits |
-| Diff computation | Python `difflib.unified_diff` (section-level) | Free, fast, runs inside the existing Fargate task |
-| Search | Elasticsearch 8.x | Already in production at Parspec; LLM query rewriting eliminates need for hybrid vector search |
-| Primary VLM | Gemini 2.5 Flash-Lite (Flex tier) | Best $/quality for document understanding at scale |
-| Bigger LLM | Gemini 2.5 Flash | Handles all Inferred and Empty field resolution |
-| Query-rewrite LLM | Gemini 2.5 Flash-Lite (Redis-cached) | Small, fast, cacheable; output feeds directly into structured ES filters |
-| Image embeddings | Gemini Embedding 2 ($0.00012/image, API) | No GPU infrastructure; pay-per-use |
-| Schema / validation | Pydantic v2, JSON Schema | Python-native, runtime validation |
-| API layer | FastAPI on Fargate behind API Gateway | Type-safe, async, OpenAPI |
-| IaC | Terraform | Standard |
-| CI/CD | GitHub Actions → ECR → Lambda/Fargate deploy | Prompt and schema changes flow through the same pipeline as code |
-| Observability | OpenTelemetry, Datadog APM/logs/metrics, Langfuse (LLM call tracing + eval) | Non-negotiable for per-call prompt/response/cost inspection |
-| Feature flags / config | AWS AppConfig | Per-tenant schema versions, A/B extraction strategies |
-| Secrets | AWS Secrets Manager | Rotatable, audited |
+| Compute — fast path | AWS Lambda | Scales 0 → thousands instantly; fits within 15-min ceiling for Gemini Standard |
+| Compute — slow path | AWS Fargate (ephemeral ECS) | No timeout ceiling; handles Flex/Batch polling up to 24 h |
+| Event routing | EventBridge + SQS FIFO | S3 event → queue; SHA-256 dedup; burst buffering; Flex → Batch auto-failover |
+| Storage | S3, DynamoDB, Redis Elasticache | S3 for raw/canonical/derived artifacts; DynamoDB for registry and preferences; Redis for query cache |
+| Diff computation | Python `difflib.unified_diff` | Runs inside existing Fargate task; no additional infrastructure |
+| Search | Elasticsearch 8.x | Already in production; structured query rewriting eliminates need for vector search on primary path |
+| Primary VLM | Gemini 2.5 Flash-Lite (Flex/Batch) | Best $/quality for document understanding; 50% off on Flex/Batch |
+| Bigger LLM | Gemini 2.5 Flash | Resolves Inferred and Empty fields; invoked on ~10% of PDFs |
+| Query-rewrite LLM | Gemini 2.5 Flash-Lite (Redis-cached) | NL → structured ES filters; cached output amortizes per-query cost |
+| Image embeddings | Gemini Embedding 2 | $0.00012/image; no GPU; runs in parallel with post-processing |
+| Hybrid path (fallback) | PaddleOCR + LayoutReader + LangChain Agent | Activated if Gemini is deprecated/repriced (§3.4.1); VLM called only on detected charts/tables — decouples token cost from page count |
+| Schema / validation | Pydantic v2 | Runtime validation; enforces structured output from LLM responses |
+| Observability | OpenTelemetry, Datadog APM, Langfuse | Per-call LLM tracing, cost tracking, and pipeline alerting |
 
 ---
 
@@ -586,26 +568,21 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 
 | **Risk** | **Likelihood** | **Impact** | **Mitigation** |
 |---|---|---|---|
-| VLM hallucination on specific field types | High | Medium | Per-attribute F1 dashboards; periodic offline eval on stratified sample |
-| Bigger LLM fallback rate exceeds 10% (cost spike) | Medium | Medium | Monthly threshold re-calibration; alert if fallback rate > 15% for 24h; still ~4× cheaper than human review |
-| Diff misses semantic change (text looks similar, value updated) | Medium | Low | Conservative 30% threshold; any diff triggers field-level re-check; monitor per-attribute F1 on changed PDFs separately |
-| Long-tail attributes stuck at 70–85% F1 | High | Medium | Per-attribute F1 targets; bigger LLM for rare-but-critical fields |
-| Gemini pricing increases or model deprecation | Medium | High | Multi-vendor abstraction layer; Anthropic and OpenAI as fallbacks |
-| Flex capacity scarce during demand spikes | Medium | Low | SQS holds backlog 14 days; automatic Flex → Batch failover |
-| Elasticsearch saturates at 5M+ SKUs | Medium | Medium | Index sharding by category; Qdrant migration path for >50M vectors |
-| PDF written to wrong bucket (bulk volume to fast bucket) | Low | Medium | Per-source rate limits on fast-queue SQS; IAM restricts which processes can write to which bucket |
-| Prompt injection via PDF content | Medium | Medium | Explicit prompt shielding; Pydantic-validated outputs; sanitize canonical MD before reuse |
+| VLM hallucinates numeric fields (wattage, CCT, lumens) — wrong value indexed as `Present` | High | High | Range/outlier validation in post-processing; per-attribute F1 tracked separately for numeric fields; periodic offline eval on stratified sample |
+| Extraction quality degrades as schema grows from 34 → 600 attributes — prompt too large for reliable instruction-following | High | High | Split into thematic extraction calls; per-attribute F1 regression gate on every schema bump; empirically cap attributes per prompt |
+| Bigger LLM fallback rate exceeds 15% — blended cost spikes 2–3× | Medium | Medium | Daily alert at 15%; monthly prompt calibration; fallback still ~4× cheaper than human review |
+| Multi-SKU explosion on catalog PDFs — 100+ SKUs from one PDF blows per-PDF cost and latency | Medium | Medium | SKU cap per extraction call with a secondary expansion pass; p99 SKU count and per-PDF token cost alerted on outliers |
+| Gemini 2.5 Flash-Lite deprecated or repriced — blended cost target broken | Medium | High | Migrate to hybrid architecture |
+| Prompt injection via adversarial PDF content — extraction output manipulated | Medium | Medium | Injection-shielding in all prompts; Pydantic-validated structured output; canonical Markdown sanitized before reuse |
 
 ## 8.2 Future Considerations
 
-- **Direct-to-manufacturer-website linking.** Store the original source URL on every SKU.
-- **Template learning.** After ~50 PDFs from a manufacturer, build per-manufacturer extraction hint layers to drop token count ~40%.
-- **Grounding / verifiable outputs.** Cite specific page and bounding box for every extracted attribute.
-- **MCP / agentic search.** Expose the search index via Model Context Protocol.
-- **RL from bigger LLM corrections.** Every delta JSON from the bigger LLM fallback is a training signal. Collect periodically to fine-tune the primary Gemini 2.5 Flash-Lite extractor prompt, reducing fallback rate over time.
-- **Per-page hash tracking for large PDFs.** For PDFs > 50 pages, track per-page hashes for page-level diff granularity.
-- **Per-chunk metadata.** Store extractor version, model version, page-level hash, and timestamp per SKU.
-- **Inferred-value offline audit.** Periodic batch job routing a sample of `Inferred` values to offline evaluation to measure inference accuracy and tighten the inference prompt.
+- **Direct-to-manufacturer-website parsing.** Accept a manufacturer URL as a first-class input — eliminating the manual download-and-upload step. The pipeline fetches the page, resolves any linked datasheet PDF, and processes it directly, without requiring a file to be staged in S3 first.
+- **Template learning.** After ~50 PDFs from a manufacturer, build per-manufacturer extraction hint layers to reduce token count by ~40%.
+- **Grounding / verifiable outputs.** Cite specific page and bounding box for every extracted attribute, enabling downstream auditability and user-facing provenance links.
+- **MCP / agentic search.** Expose the search index via Model Context Protocol to support LLM-native product discovery workflows.
+- **RL from bigger LLM corrections.** Every delta JSON produced by the bigger LLM fallback is a labeled training signal. Collect periodically to fine-tune the primary Gemini 2.5 Flash-Lite extractor prompt, driving down the fallback rate over time.
+- **Inferred and empty field offline audit.** Periodic batch job routing a sample of `Inferred` and `Empty` fields to offline evaluation to measure inference accuracy and tighten the extraction prompt.
 
 ---
 
@@ -621,21 +598,34 @@ Gemini Embedding 2 generates image embeddings at $0.00012/image, stored as the `
 | Inferred | Field value implied by strong context; not explicitly written; bigger LLM invoked to resolve |
 | Empty | Field absent and uninferable — bigger LLM invoked to confirm; stored as Empty if unresolvable |
 | Diff-extract | Partial re-extraction using only changed sections of a modified PDF, merged into the existing SKU record |
-| Bigger LLM | Gemini 2.5 Flash ($0.15/$1.25 per MTok) — invoked for Inferred and Empty field resolution |
+| Bigger LLM | Gemini 2.5 Flash ($0.15/$1.25 per MTok on Flex/Batch; standard $0.30/$2.50) — invoked for Inferred and Empty field resolution |
 | Schema version | Pinned Pydantic model definition; re-extractions run against a specific version |
 | F1 | Harmonic mean of precision and recall; per-attribute F1 is the primary accuracy metric |
 | Fast bucket | `s3://parspec-raw/fast/` — landing zone for PDFs requiring real-time processing |
 | Slow bucket | `s3://parspec-raw/slow/` — landing zone for PDFs processed on Flex/Batch at 50% cost |
+| DLQ | Dead Letter Queue — SQS moves a message here after all delivery retries are exhausted; any DLQ message represents a PDF that failed processing and requires manual reprocessing |
+| Flex / Batch | Two Gemini serving tiers at 50% off standard pricing. Flex completes within ~15 min when capacity is available; Batch accepts a job file and guarantees completion within 24 h. Slow-path PDFs use Flex with automatic failover to Batch on capacity rejection |
 
 ## 9.2 Monitoring & Alerting
 
-- Per-attribute F1 (weekly rolling; alert on >2% drop cycle-over-cycle)
-- Cost per PDF (daily; alert if >$0.0025)
-- Bigger LLM fallback rate — Inferred/Empty fields (alert if >15% for 24 hours)
-- Diff-extract ratio (% of changed PDFs using partial vs full re-extraction; monitor for drift)
-- Flex p95 per-PDF latency (alert if >30 min)
-- Bi-weekly cycle completion (alert if 300K-PDF backlog >48 hours from cycle start)
-- Search latency p95 (alert if >1 sec)
-- Langfuse: per-prompt success rate, per-model token cost, regression on eval set after any prompt change
+Metrics → Datadog (OpenTelemetry); LLM traces → Langfuse. Alerts page on-call; quality signals feed a weekly review.
+
+| **Metric** | **Cadence** | **Alert** |
+|---|---|---|
+| DLQ message count | Real-time | Any message |
+| Lambda / Fargate task error rate | Real-time | > 1% / > 2% over 15 min |
+| Blended cost per PDF | Daily | > $0.002 |
+| Bigger LLM fallback rate (Inferred + Empty) | Daily | > 15% of PDFs |
+| Per-attribute F1 | Weekly rolling | > 2% absolute drop cycle-over-cycle |
+| `Inferred` field rate per attribute | Weekly | > 25% on any attribute |
+| `Empty` field rate per attribute | Weekly | > 30% on any attribute |
+| Query rewriter latency (p95) | Real-time | > 800 ms |
+
+**Migration triggers** (weekly ops review — no page):
+If any of the following hold, evaluate the hybrid architecture (§3.4.1):
+
+- Avg pages-per-PDF exceeds 5
+- Gemini 2.5 Flash-Lite deprecation notice issued
+- Blended parse cost exceeds $0.002 for two consecutive cycles
 
 ---
